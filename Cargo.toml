@@ -1,0 +1,14 @@
+[package]
+name = "rusty"
+version = "0.1.0"
+authors = ["Marc DellaVolpe <marc@cureatr.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+reqwest = { version = "0.10", features = ["json", "blocking"] }
+ctrlc = {}
+serde = {features = ["derive"]}
+serde_json = {}
