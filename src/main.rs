@@ -8,10 +8,13 @@ use std::env;
 use std::io::prelude::*;
 use std::io::ErrorKind;
 use openssl::ssl::{SslMethod, SslConnector, SslVerifyMode, SslStream};
-use std::net::{TcpStream, Shutdown};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::collections::HashMap;
+use serde_json::Value;
+use rand::seq::IteratorRandom;
+
 
 fn send(s: &mut SslStream<TcpStream>, msg: &String) {
     let mut out = String::from(msg);
@@ -127,7 +130,7 @@ fn parse_message(s: &mut String) -> IrcMessage {
 }
 
 
-fn on_welcome(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, msg: &IrcMessage) {
+fn on_welcome(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, _msg: &IrcMessage) {
     join(stream, &bot.channel);
     say(stream, &bot.channel, &String::from("high"));
 }
@@ -162,7 +165,7 @@ fn on_privmsg(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, msg: &IrcMess
     }
 }
 
-fn on_ping(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, msg: &IrcMessage) {
+fn on_ping(_bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, msg: &IrcMessage) {
     let mut out = String::from("PONG :");
     out.push_str(&msg.args[0]);
     send(stream, &out);
@@ -170,7 +173,6 @@ fn on_ping(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, msg: &IrcMessage
 
 type CallbackHandler = fn(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message: &IrcMessage);
 type Command = fn(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message: &IrcMessage, rest: &String);
-
 
 struct IrcBot {
     host: String,
@@ -190,6 +192,8 @@ impl IrcBot {
     fn dispatch(&mut self, stream: &mut SslStream<TcpStream>, msg: &IrcMessage, command: &String, rest: &String) {
         let handler: Option<Command> = match command.as_str() {
             "weather" => Some(command_weather),
+            "ud" => Some(command_ud),
+            "giphy" => Some(command_giphy),
             _ => None,
         };
         if handler.is_some() {
@@ -203,8 +207,8 @@ fn connect(bot: &IrcBot) -> SslStream<TcpStream> {
     builder.set_verify(SslVerifyMode::NONE);
     let connector = builder.build();
     let tcp_stream = TcpStream::connect(&bot.host).unwrap();
-    tcp_stream.set_nodelay(true);
-    tcp_stream.set_read_timeout(Some(Duration::new(1, 0)));
+    tcp_stream.set_nodelay(true).expect("could not set nodelay");
+    tcp_stream.set_read_timeout(Some(Duration::new(1, 0))).expect("could not set timeout");
     let stream = connector.connect(&bot.host, tcp_stream).unwrap();
     return stream;
 }
@@ -219,7 +223,7 @@ fn k2f(k: f32) -> f32 {
     return k * (9./5.) - 459.67;
 }
 
-fn command_weather(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message: &IrcMessage, rest: &String) {
+fn command_weather(_bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message: &IrcMessage, rest: &String) {
     let parts: Vec<&str> = rest.split_whitespace().collect();
     if parts.len() < 1 {
         return;
@@ -238,6 +242,65 @@ fn command_weather(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message:
         }
         Err(e) => {
             println!("error: {}", e);
+       }
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct UdResponse {
+    list: Vec<HashMap<String, Value>>,
+}
+
+fn command_ud(_bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message: &IrcMessage, rest: &String) {
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    if parts.len() < 1 {
+        return;
+    }
+
+    let url = format!("https://api.urbandictionary.com/v0/define?term={}", parts.join("+"));
+    let body = reqwest::blocking::get(&url).unwrap().json::<UdResponse>();
+    match body {
+        Ok(resp) => {
+            if resp.list.len() > 0 {
+                let def = resp.list[0].get("definition");
+                let msg = String::from(def.unwrap().as_str().unwrap());
+                let target = &message.args[0];
+                say(stream, &target, &msg);
+            }
+        }
+        Err(e) => {
+            println!("error: {}", e);
+        }
+    }
+}
+
+
+#[derive(Deserialize, Debug)]
+struct GiphyResponse {
+    data: Vec<HashMap<String, Value>>,
+}
+
+
+fn command_giphy(_bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message: &IrcMessage, rest: &String) {
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    if parts.len() < 1 {
+        return;
+    }
+    let key = env::var("GIPHY_API_KEY").unwrap();
+    let url = format!("https://api.giphy.com/v1/gifs/search?api_key={}&q={}&rating=r", key, parts.join("+"));
+    let body = reqwest::blocking::get(&url).unwrap().json::<GiphyResponse>();
+
+    match body {
+        Ok(resp) => {
+            let mut rng = rand::thread_rng();
+            let item =  resp.data.iter().choose(&mut rng).unwrap();
+            let img = item.get("url");
+            let msg = String::from(img.unwrap().as_str().unwrap());
+            let target = &message.args[0];
+            say(stream, &target, &msg);
+        }
+        Err(e) => {
+            println!("error: {}", e);
         }
     }
 }
@@ -248,15 +311,15 @@ fn main() {
     let mut bot: IrcBot = IrcBot::new(String::from(&args[1]), String::from(&args[2]), String::from(&args[3]));
 
     let mut stream = connect(&bot);
-    static running: AtomicBool = AtomicBool::new(true);
+    static RUNNING: AtomicBool = AtomicBool::new(true);
     ctrlc::set_handler(|| {
         println!("shutdown..");
-        running.store(false, Ordering::Relaxed);
-    });
+        RUNNING.store(false, Ordering::Relaxed);
+    }).expect("could not set signal handler");
 
     ident(&mut stream, &bot.nick);
 
-    while running.load(Ordering::Relaxed) {
+    while RUNNING.load(Ordering::Relaxed) {
         let mut buffer = [0; 4096];
         let result = stream.read(&mut buffer);
         match result {
@@ -297,5 +360,5 @@ fn main() {
     }
 
     quit(&mut stream, &String::from("out"));
-    stream.shutdown();
+    stream.shutdown().expect("error shutting down");
 }
