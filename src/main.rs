@@ -3,20 +3,33 @@
 extern crate serde;
 extern crate ctrlc;
 extern crate reqwest;
+extern crate soup;
+extern crate regex;
+extern crate chrono;
+extern crate sentiment;
 
 use std::env;
+use std::panic::{self, AssertUnwindSafe};
 use std::io::prelude::*;
 use std::io::ErrorKind;
-use openssl::ssl::{SslMethod, SslConnector, SslVerifyMode, SslStream};
+use std::collections::HashSet;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use std::collections::HashMap;
+use std::time::Duration as Timeout;
+
+use openssl::ssl::{SslMethod, SslConnector, SslVerifyMode, SslStream};
 use serde_json::Value;
 use rand::seq::IteratorRandom;
+use soup::prelude::*;
+use soup::Soup;
+use regex::Regex;
+use chrono::{DateTime, Utc, Duration};
+
+type IrcConnection = SslStream<TcpStream>;
 
 
-fn send(s: &mut SslStream<TcpStream>, msg: &String) {
+fn send(s: &mut IrcConnection, msg: &String) {
     let mut out = String::from(msg);
     println!(">>> {}", out);
     out.push_str("\r\n");
@@ -31,20 +44,25 @@ fn send(s: &mut SslStream<TcpStream>, msg: &String) {
     }
 }
 
-fn ident(s: &mut SslStream<TcpStream>, nick: &String) {
+fn ident(s: &mut IrcConnection, nick: &String) {
     send(s, &format!("NICK {}", nick));
     send(s, &format!("USER {} 0 * :{}", nick, nick));
 }
 
-fn join(s: &mut SslStream<TcpStream>, channel: &String) {
+fn join(s: &mut IrcConnection, channel: &String) {
     send(s, &format!("JOIN :{}", channel))
 }
 
-fn say(s: &mut SslStream<TcpStream>, target: &String, what: &String) {
-    send(s, &format!("PRIVMSG {} :{}", target, what));
+fn say(stream: &mut IrcConnection, target: &String, what: &String) {
+    let mut s = what.replace("\n", "  ");
+    if s.len() > 400 {
+        s = String::from(&s[..400]);
+        s.push_str("...");
+    }
+    send(stream, &format!("PRIVMSG {} :{}", target, &s));
 }
 
-fn quit(s: &mut SslStream<TcpStream>, msg: &String) {
+fn quit(s: &mut IrcConnection, msg: &String) {
     send(s, &format!("QUIT :{}", msg));
 }
 
@@ -130,12 +148,12 @@ fn parse_message(s: &mut String) -> IrcMessage {
 }
 
 
-fn on_welcome(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, _msg: &IrcMessage) {
+fn on_welcome(bot: &mut IrcBot, stream: &mut IrcConnection, _msg: &IrcMessage) {
     join(stream, &bot.channel);
     say(stream, &bot.channel, &String::from("high"));
 }
 
-fn on_privmsg(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, msg: &IrcMessage) {
+fn on_privmsg(bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) {
     if msg.args[0] != bot.channel {
         return;
     }
@@ -156,28 +174,48 @@ fn on_privmsg(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, msg: &IrcMess
         let command = String::from(&msg.args[1][1..end_idx]);
         let rest;
         if msg.args[1].len() > end_idx + 1 {
-            rest = String::from(&msg.args[1][end_idx+1..]);
+            rest = String::from(msg.args[1][end_idx+1..].trim());
         } else {
             rest = String::from("");
         }
         println!("command: {} / rest: {}", command, rest);
         bot.dispatch(stream, &msg, &command, &rest);
+    } else {
+        bot.see(stream, &msg);
     }
 }
 
-fn on_ping(_bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, msg: &IrcMessage) {
+fn on_ping(_bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) {
     let mut out = String::from("PONG :");
     out.push_str(&msg.args[0]);
     send(stream, &out);
 }
 
-type CallbackHandler = fn(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message: &IrcMessage);
-type Command = fn(bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message: &IrcMessage, rest: &String);
+type CallbackHandler = fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage);
+type Command = fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String);
 
+
+#[derive(Debug)]
+struct SeenUrl {
+    owner: String,
+    count: i32,
+    first: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct SeenNick {
+    sentiment_score: f32,
+    statements: i32,
+}
+
+#[derive(Debug)]
 struct IrcBot {
     host: String,
     nick: String,
     channel: String,
+    seen_urls: HashMap<String, SeenUrl>,
+    seen_nicks: HashMap<String, SeenNick>,
+    last_greet: DateTime<Utc>
 }
 
 impl IrcBot {
@@ -186,29 +224,111 @@ impl IrcBot {
             host: host,
             nick: nick,
             channel: channel,
+            seen_urls: HashMap::new(),
+            seen_nicks: HashMap::new(),
+            last_greet: Utc::now(),
         }
     }
 
-    fn dispatch(&mut self, stream: &mut SslStream<TcpStream>, msg: &IrcMessage, command: &String, rest: &String) {
+    fn dispatch(&mut self, stream: &mut IrcConnection, msg: &IrcMessage, command: &String, rest: &String) {
         let handler: Option<Command> = match command.as_str() {
             "weather" => Some(command_weather),
             "ud" => Some(command_ud),
             "giphy" => Some(command_giphy),
+            "strain" => Some(command_strain),
+            "nega" => Some(command_nega),
             _ => None,
         };
         if handler.is_some() {
-            handler.unwrap()(self, stream, &msg, rest);
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                handler.unwrap()(self, stream, &msg, rest);
+            }));
+            if result.is_err() {
+                println!("error: {:?}", result.unwrap());
+            }
+        }
+    }
+
+    fn see(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) {
+        self.check_greeting(stream, msg);
+        self.scrape_urls(stream, msg);
+        self.check_emote(stream, msg);
+        self.check_sentiment(stream, msg);
+    }
+
+    fn check_greeting(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) {
+        let greetings :HashSet<&str> = ["hi", "high", "hello", "sirs", "pals", "buddies", "friends", "amigos"].iter().cloned().collect();
+
+        let now = Utc::now();
+        let should_greet =(self.last_greet + Duration::minutes(5)) < now;
+        if msg.args.len() == 2 && greetings.contains(&msg.args[1].as_str()) && should_greet {
+            let target = &msg.args[0];
+            let mut rng = rand::thread_rng();
+            say(stream, &target, &String::from(*greetings.iter().choose(&mut rng).unwrap()));
+            self.last_greet = now;
+        }
+    }
+
+    fn check_emote(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) {
+        let re = Regex::new(r"<3\b").unwrap();
+        let target = &msg.args[0];
+        let text = msg.args[1..].join(" ");
+        if re.is_match(&text.as_str()) {
+            say(stream, &target, &String::from("❤️"));
+        }
+    }
+
+    fn check_sentiment(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) {
+        let result = sentiment::analyze(msg.args[1].clone());
+        let target = &msg.args[0];
+
+        match self.seen_nicks.get_mut(&msg.prefix.nick) {
+            Some(seen) => {
+                seen.sentiment_score += result.score;
+                seen.statements += 1;
+            },
+            None => {
+                self.seen_nicks.insert(msg.prefix.nick.clone(), SeenNick {
+                    sentiment_score: result.score,
+                    statements: 1,
+                });
+            }
+        }
+    }
+
+    fn scrape_urls(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) {
+        let re = Regex::new(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+").unwrap();
+        let text = msg.args[1..].join(" ");
+        for found in re.find_iter(&text) {
+            let url = &text[found.start()..found.end()];
+            match self.seen_urls.get_mut(url) {
+                Some(seen) => {
+                    if msg.prefix.nick != seen.owner {
+                        seen.count += 1;
+                        let target = &msg.args[0];
+                        say(stream, &target, &format!("repost: {} (first seen at {} by {} / repost count: {})",
+                                                      url, seen.first.to_rfc2822(), seen.owner, seen.count));
+                    }
+                },
+                None => {
+                    self.seen_urls.insert(url.to_string(), SeenUrl {
+                        owner: String::from(&msg.prefix.nick),
+                        count: 1,
+                        first: Utc::now()
+                    });
+                }
+            }
         }
     }
 }
 
-fn connect(bot: &IrcBot) -> SslStream<TcpStream> {
+fn connect(bot: &IrcBot) -> IrcConnection {
     let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
     builder.set_verify(SslVerifyMode::NONE);
     let connector = builder.build();
     let tcp_stream = TcpStream::connect(&bot.host).unwrap();
     tcp_stream.set_nodelay(true).expect("could not set nodelay");
-    tcp_stream.set_read_timeout(Some(Duration::new(1, 0))).expect("could not set timeout");
+    tcp_stream.set_read_timeout(Some(Timeout::new(1, 0))).expect("could not set timeout");
     let stream = connector.connect(&bot.host, tcp_stream).unwrap();
     return stream;
 }
@@ -223,7 +343,33 @@ fn k2f(k: f32) -> f32 {
     return k * (9./5.) - 459.67;
 }
 
-fn command_weather(_bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message: &IrcMessage, rest: &String) {
+
+fn get_reqw_client() -> reqwest::blocking::Client {
+    let client = reqwest::blocking::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    return client;
+}
+
+fn command_nega(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) {
+    if rest.len() < 1 {
+        return;
+    }
+
+    let nick = rest;
+    match bot.seen_nicks.get(nick) {
+        Some(seen) => {
+            let target = &message.args[0];
+            let msg = format!("avg nega for {} is {}", nick, seen.sentiment_score / seen.statements as f32);
+            say(stream, &target, &msg)
+        },
+        None => {},
+    }
+}
+
+
+fn command_weather(_bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) {
     let parts: Vec<&str> = rest.split_whitespace().collect();
     if parts.len() < 1 {
         return;
@@ -232,7 +378,13 @@ fn command_weather(_bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message
     let key = env::var("OPENWEATHER_API_KEY").unwrap();
     let url = format!("https://api.openweathermap.org/data/2.5/weather?q={},us&APPID={}", parts[0], key);
     println!("weather: {}", url);
-    let body = reqwest::blocking::get(&url).unwrap().json::<WeatherResponse>();
+    let result = get_reqw_client()
+        .get(&url)
+        .send();
+    if result.is_err() {
+        return;
+    }
+    let body = result.unwrap().json::<WeatherResponse>();
     match body {
         Ok(resp) => {
             let feels_like = k2f(*resp.main.get("temp").unwrap());
@@ -251,14 +403,19 @@ struct UdResponse {
     list: Vec<HashMap<String, Value>>,
 }
 
-fn command_ud(_bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message: &IrcMessage, rest: &String) {
+fn command_ud(_bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) {
     let parts: Vec<&str> = rest.split_whitespace().collect();
     if parts.len() < 1 {
         return;
     }
 
     let url = format!("https://api.urbandictionary.com/v0/define?term={}", parts.join("+"));
-    let body = reqwest::blocking::get(&url).unwrap().json::<UdResponse>();
+    let result = get_reqw_client().get(&url).send();
+    if result.is_err() {
+        return;
+    }
+
+    let body = result.unwrap().json::<UdResponse>();
     match body {
         Ok(resp) => {
             if resp.list.len() > 0 {
@@ -281,23 +438,81 @@ struct GiphyResponse {
 }
 
 
-fn command_giphy(_bot: &mut IrcBot, stream: &mut SslStream<TcpStream>, message: &IrcMessage, rest: &String) {
+fn command_giphy(_bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) {
     let parts: Vec<&str> = rest.split_whitespace().collect();
     if parts.len() < 1 {
         return;
     }
     let key = env::var("GIPHY_API_KEY").unwrap();
     let url = format!("https://api.giphy.com/v1/gifs/search?api_key={}&q={}&rating=r", key, parts.join("+"));
-    let body = reqwest::blocking::get(&url).unwrap().json::<GiphyResponse>();
+    let result = get_reqw_client()
+        .get(&url)
+        .send();
+    if result.is_err() {
+        return;
+    }
+
+    let body = result.unwrap().json::<GiphyResponse>();
 
     match body {
         Ok(resp) => {
             let mut rng = rand::thread_rng();
+            if resp.data.len() == 0 {
+                return;
+            }
             let item =  resp.data.iter().choose(&mut rng).unwrap();
             let img = item.get("url");
             let msg = String::from(img.unwrap().as_str().unwrap());
             let target = &message.args[0];
             say(stream, &target, &msg);
+        }
+        Err(e) => {
+            println!("error: {}", e);
+        }
+    }
+}
+
+fn parse_strain(html: &String) -> Option<String> {
+    let soup = Soup::new(html);
+    for div in soup.tag("div").find_all() {
+        let class = div.get("class");
+        if class.is_none() {
+            continue;
+        }
+
+        let has_description = class.unwrap().find("strain__description");
+        if has_description.is_none() {
+            continue;
+        }
+        return Some(div.text());
+    }
+
+    return None;
+}
+
+fn command_strain(_bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) {
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    if parts.len() < 1 {
+        return;
+    }
+    let name = parts.join("-");
+    let url = format!("https://www.leafly.com/strains/{}", name);
+    let result = get_reqw_client()
+        .get(&url)
+        .send();
+
+    if result.is_err() {
+        return;
+    }
+    let body = result.unwrap().text();
+
+    match body {
+        Ok(resp) => {
+            let result = parse_strain(&resp);
+            if result.is_some() {
+                let target = &message.args[0];
+                say(stream, target, &result.unwrap());
+            }
         }
         Err(e) => {
             println!("error: {}", e);
@@ -353,7 +568,7 @@ fn main() {
                     _ => {
                         println!("error: {}", e);
                         break;
-                    },
+                    }
                 }
             }
         }

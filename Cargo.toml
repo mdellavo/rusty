@@ -13,3 +13,7 @@ ctrlc = {}
 serde = {features = ["derive"]}
 serde_json = {}
 rand = {}
+soup = {}
+regex = {}
+chrono = {}
+sentiment = {}
