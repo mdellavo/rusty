@@ -1,73 +1,66 @@
-#[macro_use]
-
-extern crate serde;
 extern crate ctrlc;
-extern crate reqwest;
-extern crate soup;
 extern crate regex;
 extern crate chrono;
-extern crate sentiment;
+extern crate clap;
 
-use std::env;
-use std::panic::{self, AssertUnwindSafe};
+use std::error::Error;
 use std::io::prelude::*;
 use std::io::ErrorKind;
+use std::thread;
+use std::time::Duration as Timeout;
 use std::collections::HashSet;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
-use std::time::Duration as Timeout;
 
+use log;
+use env_logger;
+use clap::{Arg, App};
 use openssl::ssl::{SslMethod, SslConnector, SslVerifyMode, SslStream};
-use serde_json::Value;
 use rand::seq::IteratorRandom;
-use soup::prelude::*;
-use soup::Soup;
 use regex::Regex;
 use chrono::{DateTime, Utc, Duration};
 
 type IrcConnection = SslStream<TcpStream>;
 
+mod commands;
 
-fn send(s: &mut IrcConnection, msg: &String) {
+fn send(s: &mut IrcConnection, msg: &String)-> Result<(), Box<dyn Error>> {
+    log::debug!("outgoing message: {}", msg);
     let mut out = String::from(msg);
-    println!(">>> {}", out);
     out.push_str("\r\n");
-    let result = s.write(out.as_bytes());
-    match result {
-        Ok(_) => {
-
-        },
-        Err(e) => {
-            println!("error: {}", e);
-        }
-    }
+    s.write(out.as_bytes())?;
+    Ok(())
 }
 
-fn ident(s: &mut IrcConnection, nick: &String) {
-    send(s, &format!("NICK {}", nick));
-    send(s, &format!("USER {} 0 * :{}", nick, nick));
+fn ident(s: &mut IrcConnection, nick: &String) -> Result<(), Box<dyn Error>> {
+    send(s, &format!("NICK {}", nick))?;
+    send(s, &format!("USER {} 0 * :{}", nick, nick))?;
+    Ok(())
 }
 
-fn join(s: &mut IrcConnection, channel: &String) {
-    send(s, &format!("JOIN :{}", channel))
+fn join(s: &mut IrcConnection, channel: &String) -> Result<(), Box<dyn Error>> {
+    send(s, &format!("JOIN :{}", channel))?;
+    Ok(())
 }
 
-fn say(stream: &mut IrcConnection, target: &String, what: &String) {
+pub fn say(stream: &mut IrcConnection, target: &String, what: &String) -> Result<(), Box<dyn Error>> {
     let mut s = what.replace("\n", "  ");
-    if s.len() > 400 {
-        s = String::from(&s[..400]);
+    if s.len() > 1000 {
+        s = String::from(&s[..1000]);
         s.push_str("...");
     }
-    send(stream, &format!("PRIVMSG {} :{}", target, &s));
+    send(stream, &format!("PRIVMSG {} :{}", target, &s))?;
+    Ok(())
 }
 
-fn quit(s: &mut IrcConnection, msg: &String) {
-    send(s, &format!("QUIT :{}", msg));
+fn quit(s: &mut IrcConnection, msg: &String) -> Result<(), Box<dyn Error>> {
+    send(s, &format!("QUIT :{}", msg))?;
+    Ok(())
 }
 
 #[derive(Debug)]
-struct IrcPrefix {
+pub struct IrcPrefix {
     host: String,
     nick: String,
     realname: String,
@@ -76,15 +69,11 @@ struct IrcPrefix {
 fn parse_prefix(s: &String) -> IrcPrefix {
     let (host, nick, realname);
 
-    let hostsep = s.find("@");
-    if hostsep.is_some() {
-        let host_idx = hostsep.unwrap();
+    if let Some(host_idx) = s.find("@") {
         host = String::from(&s[host_idx+1..]);
 
         let prefix = String::from(&s[..host_idx]);
-        let prefixsep = prefix.find("!");
-        if prefixsep.is_some() {
-            let prefix_idx = prefixsep.unwrap();
+        if let Some(prefix_idx) = prefix.find("!") {
             nick = String::from(&prefix[..prefix_idx]);
             realname = String::from(&prefix[prefix_idx+1..]);
         } else {
@@ -105,7 +94,7 @@ fn parse_prefix(s: &String) -> IrcPrefix {
 }
 
 #[derive(Debug)]
-struct IrcMessage {
+pub struct IrcMessage {
     prefix: IrcPrefix,
     command: String,
     args: Vec<String>
@@ -117,21 +106,17 @@ fn parse_message(s: &mut String) -> IrcMessage {
     let mut idx = 0;
 
     if s.starts_with(":") {
-        idx = s.find(" ").unwrap();
+        idx = s.find(" ").unwrap_or(s.len());
         prefix = String::from(&s[1..idx]);
     }
 
-    let trailing = s.find(" :");
-    if trailing.is_some() {
-        let trailin_idx = trailing.unwrap();
-
-        let trailing = String::from(&s[trailin_idx+2..]);
-        let rest = String::from(&s[idx..trailin_idx]);
+    if let Some(trailing_idx) = s.find(" :") {
+        let trailing = String::from(&s[trailing_idx+2..]);
+        let rest = String::from(&s[idx..trailing_idx]);
         for part in rest.split_whitespace() {
             args.push(String::from(part));
         }
         args.push(trailing)
-
     } else {
         let rest = String::from(&s[idx..]);
         for part in rest.split_whitespace() {
@@ -140,7 +125,7 @@ fn parse_message(s: &mut String) -> IrcMessage {
     }
 
     let command = args.remove(0);
-    IrcMessage{
+    IrcMessage {
         prefix: parse_prefix(&prefix),
         command: command,
         args: args
@@ -148,20 +133,21 @@ fn parse_message(s: &mut String) -> IrcMessage {
 }
 
 
-fn on_welcome(bot: &mut IrcBot, stream: &mut IrcConnection, _msg: &IrcMessage) {
-    join(stream, &bot.channel);
-    say(stream, &bot.channel, &String::from("high"));
+fn on_welcome(bot: &mut IrcBot, stream: &mut IrcConnection, _msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
+    join(stream, &bot.channel)?;
+    say(stream, &bot.channel, &String::from("high"))?;
+    Ok(())
 }
 
-fn on_privmsg(bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) {
+fn on_privmsg(bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
     if msg.args[0] != bot.channel {
-        return;
+        return Ok(());
     }
 
     let mut prefix = String::from(&bot.nick);
     prefix.push_str(": ");
     if msg.args[1].starts_with(&prefix) {
-        say(stream, &bot.channel, &String::from("sup?"))
+        say(stream, &bot.channel, &String::from("sup?"))?;
     } else if msg.args[1].starts_with("!") {
         let end = msg.args[1].find(" ");
         let end_idx;
@@ -178,44 +164,46 @@ fn on_privmsg(bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) {
         } else {
             rest = String::from("");
         }
-        println!("command: {} / rest: {}", command, rest);
-        bot.dispatch(stream, &msg, &command, &rest);
+        bot.dispatch(stream, &msg, &command, &rest)?;
     } else {
-        bot.see(stream, &msg);
+        bot.see(stream, &msg)?;
     }
+    Ok(())
 }
 
-fn on_ping(_bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) {
+fn on_ping(_bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
     let mut out = String::from("PONG :");
     out.push_str(&msg.args[0]);
-    send(stream, &out);
+    send(stream, &out)?;
+    Ok(())
 }
 
-type CallbackHandler = fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage);
-type Command = fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String);
+type CallbackHandler = fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage) -> Result<(), Box<dyn Error>>;
+type Command = fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) -> Result<(), Box<dyn Error>>;
 
 
 #[derive(Debug)]
-struct SeenUrl {
+pub struct SeenUrl {
     owner: String,
     count: i32,
     first: DateTime<Utc>,
 }
 
 #[derive(Debug)]
-struct SeenNick {
+pub struct SeenNick {
     sentiment_score: f32,
     statements: i32,
 }
 
 #[derive(Debug)]
-struct IrcBot {
+pub struct IrcBot {
     host: String,
     nick: String,
     channel: String,
+    ignore: Option<Vec<String>>,
     seen_urls: HashMap<String, SeenUrl>,
     seen_nicks: HashMap<String, SeenNick>,
-    last_greet: DateTime<Utc>
+    last_greet: DateTime<Utc>,
 }
 
 impl IrcBot {
@@ -224,39 +212,48 @@ impl IrcBot {
             host: host,
             nick: nick,
             channel: channel,
+            ignore: None,
             seen_urls: HashMap::new(),
             seen_nicks: HashMap::new(),
             last_greet: Utc::now(),
         }
     }
 
-    fn dispatch(&mut self, stream: &mut IrcConnection, msg: &IrcMessage, command: &String, rest: &String) {
+    fn set_ignore(&mut self, ignore: Option<Vec<String>>) {
+        self.ignore = ignore;
+    }
+
+    fn dispatch(&mut self, stream: &mut IrcConnection, msg: &IrcMessage, command: &String, rest: &String) -> Result<(), Box<dyn Error>> {
         let handler: Option<Command> = match command.as_str() {
-            "weather" => Some(command_weather),
-            "ud" => Some(command_ud),
-            "giphy" => Some(command_giphy),
-            "strain" => Some(command_strain),
-            "nega" => Some(command_nega),
+            "weather" => Some(commands::command_weather),
+            "ud" => Some(commands::command_ud),
+            "giphy" => Some(commands::command_giphy),
+            "strain" => Some(commands::command_strain),
+            "nega" => Some(commands::command_nega),
+            "image" => Some(commands::command_image),
             _ => None,
         };
-        if handler.is_some() {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                handler.unwrap()(self, stream, &msg, rest);
-            }));
-            if result.is_err() {
-                println!("error: {:?}", result.unwrap());
+
+        if let Some(handler_fn) = handler {
+            if let Err(e) = handler_fn(self, stream, &msg, rest) {
+                log::error!("command errored: {}", e);
             }
         }
+
+        Ok(())
     }
 
-    fn see(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) {
-        self.check_greeting(stream, msg);
-        self.scrape_urls(stream, msg);
-        self.check_emote(stream, msg);
-        self.check_sentiment(stream, msg);
+    fn see(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
+        self.check_sentiment(msg);
+
+        self.scrape_urls(stream, msg)?;
+        self.check_greeting(stream, msg)?;
+        self.check_emote(stream, msg)?;
+
+        Ok(())
     }
 
-    fn check_greeting(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) {
+    fn check_greeting(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
         let greetings :HashSet<&str> = ["hi", "high", "hello", "sirs", "pals", "buddies", "friends", "amigos"].iter().cloned().collect();
 
         let now = Utc::now();
@@ -264,23 +261,24 @@ impl IrcBot {
         if msg.args.len() == 2 && greetings.contains(&msg.args[1].as_str()) && should_greet {
             let target = &msg.args[0];
             let mut rng = rand::thread_rng();
-            say(stream, &target, &String::from(*greetings.iter().choose(&mut rng).unwrap()));
+            say(stream, &target, &String::from(*greetings.iter().choose(&mut rng).unwrap()))?;
             self.last_greet = now;
         }
+        Ok(())
     }
 
-    fn check_emote(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) {
+    fn check_emote(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
         let re = Regex::new(r"<3\b").unwrap();
         let target = &msg.args[0];
         let text = msg.args[1..].join(" ");
         if re.is_match(&text.as_str()) {
-            say(stream, &target, &String::from("❤️"));
+            say(stream, &target, &String::from("❤️"))?;
         }
+        Ok(())
     }
 
-    fn check_sentiment(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) {
+    fn check_sentiment(&mut self, msg: &IrcMessage) {
         let result = sentiment::analyze(msg.args[1].clone());
-        let target = &msg.args[0];
 
         match self.seen_nicks.get_mut(&msg.prefix.nick) {
             Some(seen) => {
@@ -296,7 +294,7 @@ impl IrcBot {
         }
     }
 
-    fn scrape_urls(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) {
+    fn scrape_urls(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
         let re = Regex::new(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+").unwrap();
         let text = msg.args[1..].join(" ");
         for found in re.find_iter(&text) {
@@ -307,7 +305,7 @@ impl IrcBot {
                         seen.count += 1;
                         let target = &msg.args[0];
                         say(stream, &target, &format!("repost: {} (first seen at {} by {} / repost count: {})",
-                                                      url, seen.first.to_rfc2822(), seen.owner, seen.count));
+                                                      url, seen.first.to_rfc2822(), seen.owner, seen.count))?;
                     }
                 },
                 None => {
@@ -319,261 +317,142 @@ impl IrcBot {
                 }
             }
         }
+        Ok(())
     }
 }
 
-fn connect(bot: &IrcBot) -> IrcConnection {
-    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+
+fn connect(bot: &IrcBot) -> Result<IrcConnection, Box<dyn Error>> {
+    let mut builder = SslConnector::builder(SslMethod::tls())?;
     builder.set_verify(SslVerifyMode::NONE);
     let connector = builder.build();
-    let tcp_stream = TcpStream::connect(&bot.host).unwrap();
-    tcp_stream.set_nodelay(true).expect("could not set nodelay");
-    tcp_stream.set_read_timeout(Some(Timeout::new(1, 0))).expect("could not set timeout");
-    let stream = connector.connect(&bot.host, tcp_stream).unwrap();
-    return stream;
-}
-
-#[derive(Deserialize, Debug)]
-struct WeatherResponse {
-    name: String,
-    main: HashMap<String, f32>,
-}
-
-fn k2f(k: f32) -> f32 {
-    return k * (9./5.) - 459.67;
+    let tcp_stream = TcpStream::connect(&bot.host)?;
+    tcp_stream.set_nodelay(true)?;
+    tcp_stream.set_read_timeout(Some(Timeout::from_millis(1000)))?;
+    let stream = connector.connect(&bot.host, tcp_stream)?;
+    Ok(stream)
 }
 
 
-fn get_reqw_client() -> reqwest::blocking::Client {
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
-    return client;
-}
-
-fn command_nega(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) {
-    if rest.len() < 1 {
-        return;
-    }
-
-    let nick = rest;
-    match bot.seen_nicks.get(nick) {
-        Some(seen) => {
-            let target = &message.args[0];
-            let msg = format!("avg nega for {} is {}", nick, seen.sentiment_score / seen.statements as f32);
-            say(stream, &target, &msg)
-        },
-        None => {},
-    }
-}
-
-
-fn command_weather(_bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) {
-    let parts: Vec<&str> = rest.split_whitespace().collect();
-    if parts.len() < 1 {
-        return;
-    }
-
-    let key = env::var("OPENWEATHER_API_KEY").unwrap();
-    let url = format!("https://api.openweathermap.org/data/2.5/weather?q={},us&APPID={}", parts[0], key);
-    println!("weather: {}", url);
-    let result = get_reqw_client()
-        .get(&url)
-        .send();
-    if result.is_err() {
-        return;
-    }
-    let body = result.unwrap().json::<WeatherResponse>();
-    match body {
-        Ok(resp) => {
-            let feels_like = k2f(*resp.main.get("temp").unwrap());
-            let msg = format!("the actual temp in {} is {:.0}f", resp.name, feels_like);
-            let target = &message.args[0];
-            say(stream, &target, &msg);
+fn handle_message(data: String, bot: &mut IrcBot, stream: &mut IrcConnection) -> Result<(), Box<dyn Error>> {
+    let lines = data.lines();
+    for line in lines {
+        if line.len() == 0 {
+            break;
         }
-        Err(e) => {
-            println!("error: {}", e);
-       }
-    }
-}
 
-#[derive(Deserialize, Debug)]
-struct UdResponse {
-    list: Vec<HashMap<String, Value>>,
-}
+        let msg = parse_message(&mut String::from(line));
 
-fn command_ud(_bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) {
-    let parts: Vec<&str> = rest.split_whitespace().collect();
-    if parts.len() < 1 {
-        return;
-    }
-
-    let url = format!("https://api.urbandictionary.com/v0/define?term={}", parts.join("+"));
-    let result = get_reqw_client().get(&url).send();
-    if result.is_err() {
-        return;
-    }
-
-    let body = result.unwrap().json::<UdResponse>();
-    match body {
-        Ok(resp) => {
-            if resp.list.len() > 0 {
-                let def = resp.list[0].get("definition");
-                let msg = String::from(def.unwrap().as_str().unwrap());
-                let target = &message.args[0];
-                say(stream, &target, &msg);
+        if let Some(ignored) = &bot.ignore {
+            if ignored.iter().any(|s| s == &msg.prefix.nick) {
+                log::debug!("dropped: {:?}", msg);
+                return Ok(());
             }
         }
-        Err(e) => {
-            println!("error: {}", e);
-        }
-    }
-}
 
+        log::debug!("incoming message: {:?}", msg);
 
-#[derive(Deserialize, Debug)]
-struct GiphyResponse {
-    data: Vec<HashMap<String, Value>>,
-}
+        let handler: Option<CallbackHandler> = match msg.command.as_str() {
+            "001" => Some(on_welcome),
+            "PRIVMSG" => Some(on_privmsg),
+            "PING" => Some(on_ping),
+            _ => None,
+        };
 
-
-fn command_giphy(_bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) {
-    let parts: Vec<&str> = rest.split_whitespace().collect();
-    if parts.len() < 1 {
-        return;
-    }
-    let key = env::var("GIPHY_API_KEY").unwrap();
-    let url = format!("https://api.giphy.com/v1/gifs/search?api_key={}&q={}&rating=r", key, parts.join("+"));
-    let result = get_reqw_client()
-        .get(&url)
-        .send();
-    if result.is_err() {
-        return;
-    }
-
-    let body = result.unwrap().json::<GiphyResponse>();
-
-    match body {
-        Ok(resp) => {
-            let mut rng = rand::thread_rng();
-            if resp.data.len() == 0 {
-                return;
-            }
-            let item =  resp.data.iter().choose(&mut rng).unwrap();
-            let img = item.get("url");
-            let msg = String::from(img.unwrap().as_str().unwrap());
-            let target = &message.args[0];
-            say(stream, &target, &msg);
-        }
-        Err(e) => {
-            println!("error: {}", e);
-        }
-    }
-}
-
-fn parse_strain(html: &String) -> Option<String> {
-    let soup = Soup::new(html);
-    for div in soup.tag("div").find_all() {
-        let class = div.get("class");
-        if class.is_none() {
-            continue;
-        }
-
-        let has_description = class.unwrap().find("strain__description");
-        if has_description.is_none() {
-            continue;
-        }
-        return Some(div.text());
-    }
-
-    return None;
-}
-
-fn command_strain(_bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) {
-    let parts: Vec<&str> = rest.split_whitespace().collect();
-    if parts.len() < 1 {
-        return;
-    }
-    let name = parts.join("-");
-    let url = format!("https://www.leafly.com/strains/{}", name);
-    let result = get_reqw_client()
-        .get(&url)
-        .send();
-
-    if result.is_err() {
-        return;
-    }
-    let body = result.unwrap().text();
-
-    match body {
-        Ok(resp) => {
-            let result = parse_strain(&resp);
-            if result.is_some() {
-                let target = &message.args[0];
-                say(stream, target, &result.unwrap());
+        if let Some(handler_fn) = handler {
+            if let Err(e) = handler_fn(bot, stream, &msg) {
+                log::error!("error handling message: {}", e);
             }
         }
-        Err(e) => {
-            println!("error: {}", e);
-        }
     }
+
+    Ok(())
 }
 
-fn main() {
 
-    let args: Vec<String> = env::args().collect();
-    let mut bot: IrcBot = IrcBot::new(String::from(&args[1]), String::from(&args[2]), String::from(&args[3]));
+fn bot_main(running: &AtomicBool, bot: &mut IrcBot, stream: &mut IrcConnection) -> Result<(), Box<dyn Error>> {
+    ident(stream, &bot.nick)?;
 
-    let mut stream = connect(&bot);
-    static RUNNING: AtomicBool = AtomicBool::new(true);
-    ctrlc::set_handler(|| {
-        println!("shutdown..");
-        RUNNING.store(false, Ordering::Relaxed);
-    }).expect("could not set signal handler");
-
-    ident(&mut stream, &bot.nick);
-
-    while RUNNING.load(Ordering::Relaxed) {
+    while running.load(Ordering::Relaxed) {
         let mut buffer = [0; 4096];
-        let result = stream.read(&mut buffer);
-        match result {
+        match stream.read(&mut buffer) {
             Ok(bytes) => {
-                let data = String::from_utf8_lossy(&buffer[0..bytes]);
-                let lines = data.lines();
-                for line in lines {
-                    if line.len() == 0 {
-                        break;
-                    }
-                    let msg = parse_message(&mut String::from(line));
-                    println!("{:?}", msg);
-
-                    let handler: Option<CallbackHandler> = match msg.command.as_str() {
-                        "001" => Some(on_welcome),
-                        "PRIVMSG" => Some(on_privmsg),
-                        "PING" => Some(on_ping),
-                        _ => None,
-                    };
-                    if handler.is_some() {
-                        let handler_fn = handler.unwrap();
-                        handler_fn(&mut bot, &mut stream, &msg);
-                    }
+                let s = String::from_utf8_lossy(&buffer[0..bytes]).to_string();
+                if let Err(e) = handle_message(s, bot, stream) {
+                    log::error!("error handling message: {}", e);
                 }
             },
             Err(e) => {
-                match e.kind() {
-                    ErrorKind::WouldBlock => {
-                        continue;
-                    },
-                    _ => {
-                        println!("error: {}", e);
-                        break;
-                    }
+                if let ErrorKind::WouldBlock = e.kind() {
+                    continue;
                 }
+                return Err(Box::new(e));
             }
         }
     }
 
-    quit(&mut stream, &String::from("out"));
-    stream.shutdown().expect("error shutting down");
+    quit(stream, &String::from("out"))?;
+
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::init();
+
+    let args = App::new("rusty")
+        .version("0.1")
+        .arg(Arg::new("host")
+             .takes_value(true)
+             .required(true)
+             .index(1))
+        .arg(Arg::new("nick")
+             .takes_value(true)
+             .required(true)
+             .index(2))
+        .arg(Arg::new("channel")
+             .takes_value(true)
+             .required(true)
+             .index(3))
+        .arg(Arg::new("ignore")
+             .takes_value(true)
+             .long("ignore")
+             .multiple(true))
+        .get_matches();
+
+    let host = String::from(args.value_of("host").unwrap());
+    let nick = String::from(args.value_of("nick").unwrap());
+    let channel = String::from(args.value_of("channel").unwrap());
+    let mut bot: IrcBot = IrcBot::new(host, nick, channel);
+
+    if let Some(ignore) = args.values_of("ignore") {
+        let values: Vec<String> = ignore.map(|s| s.to_string()).collect();
+        bot.set_ignore(Some(values));
+    }
+
+    static RUNNING: AtomicBool = AtomicBool::new(true);
+    ctrlc::set_handler(|| {
+        log::info!("shutdown..");
+        RUNNING.store(false, Ordering::Relaxed);
+    })?;
+
+    while RUNNING.load(Ordering::Relaxed) {
+        log::info!("connecting to {}", bot.host);
+
+        match connect(&bot) {
+            Ok(mut stream) => {
+                if let Err(e) = bot_main(&RUNNING, &mut bot, &mut stream) {
+                    log::error!("bot errored: {}", e);
+                }
+                if let Err(e) = stream.shutdown() {
+                    log::error!("error closing stream: {}", e);
+                }
+            }
+            Err(e) => {
+                log::error!("could not connect: {}", e);
+                thread::sleep(Timeout::from_millis(5000));
+            }
+        }
+    }
+
+    Ok(())
 }

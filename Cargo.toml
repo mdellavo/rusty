@@ -17,3 +17,7 @@ soup = {}
 regex = {}
 chrono = {}
 sentiment = {}
+clap = "3.0.0-beta.2"
+image = {}
+log = {}
+env_logger = {}
