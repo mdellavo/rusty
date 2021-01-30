@@ -1,9 +1,15 @@
+#![feature(total_cmp)]
+
+#[macro_use]
+
+extern crate lazy_static;
 extern crate ctrlc;
 extern crate regex;
 extern crate chrono;
 extern crate clap;
 
-use std::error::Error;
+use std::fmt;
+use std::error;
 use std::io::prelude::*;
 use std::io::ErrorKind;
 use std::thread;
@@ -21,40 +27,70 @@ use rand::seq::IteratorRandom;
 use regex::Regex;
 use chrono::{DateTime, Utc, Duration};
 
+type Result<T> = std::result::Result<T, Box<dyn error::Error>>;
 type IrcConnection = SslStream<TcpStream>;
 
 mod commands;
 
-fn send(s: &mut IrcConnection, msg: &String)-> Result<(), Box<dyn Error>> {
-    log::debug!("outgoing message: {}", msg);
+
+
+#[derive(Debug, Clone)]
+struct Error {
+    msg: String,
+}
+
+impl Error {
+    fn new(msg: &str) -> Error {
+        Error{msg: msg.to_string()}
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.msg)
+    }
+}
+
+impl error::Error for Error {
+    fn description(&self) -> &str {
+        &self.msg
+    }
+}
+
+
+fn send(s: &mut IrcConnection, msg: &String)-> Result<()> {
     let mut out = String::from(msg);
     out.push_str("\r\n");
+
+    // log::debug!("out: {:?}", out);
     s.write(out.as_bytes())?;
     Ok(())
 }
 
-fn ident(s: &mut IrcConnection, nick: &String) -> Result<(), Box<dyn Error>> {
+fn ident(s: &mut IrcConnection, nick: &String) -> Result<()> {
     send(s, &format!("NICK {}", nick))?;
     send(s, &format!("USER {} 0 * :{}", nick, nick))?;
     Ok(())
 }
 
-fn join(s: &mut IrcConnection, channel: &String) -> Result<(), Box<dyn Error>> {
+fn join(s: &mut IrcConnection, channel: &String) -> Result<()> {
     send(s, &format!("JOIN :{}", channel))?;
     Ok(())
 }
 
-pub fn say(stream: &mut IrcConnection, target: &String, what: &String) -> Result<(), Box<dyn Error>> {
+pub fn say(stream: &mut IrcConnection, target: &String, what: &String) -> Result<()> {
     let mut s = what.replace("\n", "  ");
     if s.len() > 1000 {
         s = String::from(&s[..1000]);
         s.push_str("...");
     }
-    send(stream, &format!("PRIVMSG {} :{}", target, &s))?;
+    let mut out = format!("PRIVMSG {} :", target);
+    out.push_str(&s);
+    send(stream, &out)?;
     Ok(())
 }
 
-fn quit(s: &mut IrcConnection, msg: &String) -> Result<(), Box<dyn Error>> {
+fn quit(s: &mut IrcConnection, msg: &String) -> Result<()> {
     send(s, &format!("QUIT :{}", msg))?;
     Ok(())
 }
@@ -133,13 +169,13 @@ fn parse_message(s: &mut String) -> IrcMessage {
 }
 
 
-fn on_welcome(bot: &mut IrcBot, stream: &mut IrcConnection, _msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
+fn on_welcome(bot: &mut IrcBot, stream: &mut IrcConnection, _msg: &IrcMessage) -> Result<()> {
     join(stream, &bot.channel)?;
     say(stream, &bot.channel, &String::from("high"))?;
     Ok(())
 }
 
-fn on_privmsg(bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
+fn on_privmsg(bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
     if msg.args[0] != bot.channel {
         return Ok(());
     }
@@ -171,15 +207,15 @@ fn on_privmsg(bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) ->
     Ok(())
 }
 
-fn on_ping(_bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
+fn on_ping(_bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
     let mut out = String::from("PONG :");
     out.push_str(&msg.args[0]);
     send(stream, &out)?;
     Ok(())
 }
 
-type CallbackHandler = fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage) -> Result<(), Box<dyn Error>>;
-type Command = fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) -> Result<(), Box<dyn Error>>;
+type CallbackHandler = fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage) -> Result<()>;
+type Command = fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) -> Result<()>;
 
 
 #[derive(Debug)]
@@ -223,7 +259,7 @@ impl IrcBot {
         self.ignore = ignore;
     }
 
-    fn dispatch(&mut self, stream: &mut IrcConnection, msg: &IrcMessage, command: &String, rest: &String) -> Result<(), Box<dyn Error>> {
+    fn dispatch(&mut self, stream: &mut IrcConnection, msg: &IrcMessage, command: &String, rest: &String) -> Result<()> {
         let handler: Option<Command> = match command.as_str() {
             "weather" => Some(commands::command_weather),
             "ud" => Some(commands::command_ud),
@@ -243,7 +279,7 @@ impl IrcBot {
         Ok(())
     }
 
-    fn see(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
+    fn see(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
         self.check_sentiment(msg);
 
         self.scrape_urls(stream, msg)?;
@@ -253,7 +289,7 @@ impl IrcBot {
         Ok(())
     }
 
-    fn check_greeting(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
+    fn check_greeting(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
         let greetings :HashSet<&str> = ["hi", "high", "hello", "sirs", "pals", "buddies", "friends", "amigos"].iter().cloned().collect();
 
         let now = Utc::now();
@@ -267,7 +303,7 @@ impl IrcBot {
         Ok(())
     }
 
-    fn check_emote(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
+    fn check_emote(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
         let re = Regex::new(r"<3\b").unwrap();
         let target = &msg.args[0];
         let text = msg.args[1..].join(" ");
@@ -294,7 +330,7 @@ impl IrcBot {
         }
     }
 
-    fn scrape_urls(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<(), Box<dyn Error>> {
+    fn scrape_urls(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
         let re = Regex::new(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+").unwrap();
         let text = msg.args[1..].join(" ");
         for found in re.find_iter(&text) {
@@ -322,7 +358,7 @@ impl IrcBot {
 }
 
 
-fn connect(bot: &IrcBot) -> Result<IrcConnection, Box<dyn Error>> {
+fn connect(bot: &IrcBot) -> Result<IrcConnection> {
     let mut builder = SslConnector::builder(SslMethod::tls())?;
     builder.set_verify(SslVerifyMode::NONE);
     let connector = builder.build();
@@ -334,7 +370,7 @@ fn connect(bot: &IrcBot) -> Result<IrcConnection, Box<dyn Error>> {
 }
 
 
-fn handle_message(data: String, bot: &mut IrcBot, stream: &mut IrcConnection) -> Result<(), Box<dyn Error>> {
+fn handle_message(data: String, bot: &mut IrcBot, stream: &mut IrcConnection) -> Result<()> {
     let lines = data.lines();
     for line in lines {
         if line.len() == 0 {
@@ -370,7 +406,7 @@ fn handle_message(data: String, bot: &mut IrcBot, stream: &mut IrcConnection) ->
 }
 
 
-fn bot_main(running: &AtomicBool, bot: &mut IrcBot, stream: &mut IrcConnection) -> Result<(), Box<dyn Error>> {
+fn bot_main(running: &AtomicBool, bot: &mut IrcBot, stream: &mut IrcConnection) -> Result<()> {
     ident(stream, &bot.nick)?;
 
     while running.load(Ordering::Relaxed) {
@@ -396,7 +432,7 @@ fn bot_main(running: &AtomicBool, bot: &mut IrcBot, stream: &mut IrcConnection) 
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
     env_logger::init();
 
     let args = App::new("rusty")
