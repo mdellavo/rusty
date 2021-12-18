@@ -294,7 +294,7 @@ fn nearest_color(target: &Rgb) -> &Color {
     let nearest = COLORS.iter().min_by(|a, b| {
         let dist_a = a.color.compare_cie2000(target);
         let dist_b = b.color.compare_cie2000(target);
-        return dist_a.total_cmp(&dist_b);
+        return dist_a.partial_cmp(&dist_b).unwrap(); // FIXME
     });
     if let Some(n) = nearest {
         return &n;
