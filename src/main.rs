@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use log;
 use env_logger;
 use clap::{Arg, App};
-use openssl::ssl::{SslMethod, SslConnector, SslVerifyMode, SslStream};
+use openssl::ssl::{SslMethod, SslConnector, SslVerifyMode, SslStream, SslOptions};
 use rand::seq::IteratorRandom;
 use regex::Regex;
 use chrono::{DateTime, Utc, Duration};
@@ -29,8 +29,7 @@ type Result<T> = std::result::Result<T, Box<dyn error::Error>>;
 type IrcConnection = SslStream<TcpStream>;
 
 mod commands;
-
-
+mod utils;
 
 #[derive(Debug, Clone)]
 struct Error {
@@ -259,12 +258,12 @@ impl IrcBot {
 
     fn dispatch(&mut self, stream: &mut IrcConnection, msg: &IrcMessage, command: &String, rest: &String) -> Result<()> {
         let handler: Option<Command> = match command.as_str() {
-            "weather" => Some(commands::command_weather),
-            "ud" => Some(commands::command_ud),
-            "giphy" => Some(commands::command_giphy),
-            "strain" => Some(commands::command_strain),
-            "nega" => Some(commands::command_nega),
-            "image" => Some(commands::command_image),
+            "weather" => Some(commands::weather::command),
+            "ud" => Some(commands::ud::command),
+            "giphy" => Some(commands::giphy::command),
+            "strain" => Some(commands::strain::command),
+            "nega" => Some(commands::nega::command),
+            "image" => Some(commands::image::command),
             _ => None,
         };
 
@@ -291,7 +290,7 @@ impl IrcBot {
         let greetings :HashSet<&str> = ["hi", "high", "hello", "sirs", "pals", "buddies", "friends", "amigos"].iter().cloned().collect();
 
         let now = Utc::now();
-        let should_greet =(self.last_greet + Duration::minutes(5)) < now;
+        let should_greet = (self.last_greet + Duration::minutes(5)) < now;
         if msg.args.len() == 2 && greetings.contains(&msg.args[1].as_str()) && should_greet {
             let target = &msg.args[0];
             let mut rng = rand::thread_rng();
@@ -353,18 +352,6 @@ impl IrcBot {
         }
         Ok(())
     }
-}
-
-
-fn connect(bot: &IrcBot) -> Result<IrcConnection> {
-    let mut builder = SslConnector::builder(SslMethod::tls())?;
-    builder.set_verify(SslVerifyMode::NONE);
-    let connector = builder.build();
-    let tcp_stream = TcpStream::connect(&bot.host)?;
-    tcp_stream.set_nodelay(true)?;
-    tcp_stream.set_read_timeout(Some(Timeout::from_millis(1000)))?;
-    let stream = connector.connect(&bot.host, tcp_stream)?;
-    Ok(stream)
 }
 
 
@@ -430,6 +417,24 @@ fn bot_main(running: &AtomicBool, bot: &mut IrcBot, stream: &mut IrcConnection) 
     Ok(())
 }
 
+
+fn connect(bot: &IrcBot) -> Result<IrcConnection> {
+    let mut builder = SslConnector::builder(SslMethod::tls())?;
+    builder.set_options(SslOptions::ALL);
+    builder.set_options(SslOptions::NO_TLSV1_3);
+    builder.set_verify(SslVerifyMode::NONE);
+    let connector = builder.build();
+
+    let tcp_stream = TcpStream::connect(&bot.host)?;
+    tcp_stream.set_nodelay(true)?;
+    tcp_stream.set_read_timeout(Some(Timeout::from_millis(1000)))?;
+
+    let stream = connector.connect(&bot.host, tcp_stream)?;
+
+    Ok(stream)
+}
+
+
 fn main() -> Result<()> {
     env_logger::init();
 
@@ -450,7 +455,7 @@ fn main() -> Result<()> {
         .arg(Arg::new("ignore")
              .takes_value(true)
              .long("ignore")
-             .multiple(true))
+             .multiple_occurrences(true))
         .get_matches();
 
     let host = String::from(args.value_of("host").unwrap());

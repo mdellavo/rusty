@@ -1,13 +1,12 @@
 [package]
 name = "rusty"
-version = "0.1.0"
-authors = ["Marc DellaVolpe <marc@cureatr.com>"]
-edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+version = "0.2.0"
+authors = ["Marc DellaVolpe <marc.dellavolpe@gmail.com>"]
+edition = "2021"
 
 [dependencies]
-openssl = { version = "0.10", features = ["vendored"] }
+openssl-sys = "0.9"
+openssl = { version = "0.10" }
 reqwest = { version = "0.10", features = ["json", "blocking"] }
 ctrlc = {}
 serde = {features = ["derive"]}
@@ -23,3 +22,4 @@ log = {}
 env_logger = {}
 color_space = {}
 lazy_static = {}
+rusqlite = {}
