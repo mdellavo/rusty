@@ -2,11 +2,13 @@
 name = "rusty"
 version = "0.2.0"
 authors = ["Marc DellaVolpe <marc.dellavolpe@gmail.com>"]
-edition = "2021"
+edition = "2018"
+
+[features]
+default = ["dangerous_configuration"]
+dangerous_configuration = []
 
 [dependencies]
-openssl-sys = "0.9"
-openssl = { version = "0.10" }
 reqwest = { version = "0.10", features = ["json", "blocking"] }
 ctrlc = {}
 serde = {features = ["derive"]}
@@ -15,11 +17,14 @@ rand = {}
 soup = {}
 regex = {}
 chrono = {}
-sentiment = {}
+# sentiment = {}
 clap = "3.0.0-beta.2"
-image = {}
+# image = {}
 log = {}
 env_logger = {}
-color_space = {}
+# color_space = {}
 lazy_static = {}
 rusqlite = {}
+rustls = { features=["dangerous_configuration"] }
+webpki = {}
+webpki-roots = {}

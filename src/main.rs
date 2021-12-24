@@ -1,32 +1,33 @@
-#[macro_use]
-
 extern crate lazy_static;
 extern crate ctrlc;
 extern crate regex;
 extern crate chrono;
 extern crate clap;
+extern crate rustls;
 
 use std::fmt;
 use std::error;
 use std::io::prelude::*;
 use std::io::ErrorKind;
-use std::thread;
 use std::time::Duration as Timeout;
 use std::collections::HashSet;
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
+use std::convert::TryInto;
 
 use log;
 use env_logger;
 use clap::{Arg, App};
-use openssl::ssl::{SslMethod, SslConnector, SslVerifyMode, SslStream, SslOptions};
+use rustls::client::HandshakeSignatureValid;
+use rustls::{ClientConfig, ClientConnection, Stream};
 use rand::seq::IteratorRandom;
 use regex::Regex;
 use chrono::{DateTime, Utc, Duration};
 
 type Result<T> = std::result::Result<T, Box<dyn error::Error>>;
-type IrcConnection = SslStream<TcpStream>;
+type IrcConnection<'a> = Stream<'a, ClientConnection, TcpStream>;
 
 mod commands;
 mod utils;
@@ -224,7 +225,7 @@ pub struct SeenUrl {
 
 #[derive(Debug)]
 pub struct SeenNick {
-    sentiment_score: f32,
+    nick: String,
     statements: i32,
 }
 
@@ -256,14 +257,15 @@ impl IrcBot {
         self.ignore = ignore;
     }
 
+    // FIXME move to commands/mod.rs
     fn dispatch(&mut self, stream: &mut IrcConnection, msg: &IrcMessage, command: &String, rest: &String) -> Result<()> {
         let handler: Option<Command> = match command.as_str() {
             "weather" => Some(commands::weather::command),
             "ud" => Some(commands::ud::command),
-            "giphy" => Some(commands::giphy::command),
+            //"giphy" => Some(commands::giphy::command),
             "strain" => Some(commands::strain::command),
-            "nega" => Some(commands::nega::command),
-            "image" => Some(commands::image::command),
+            //"nega" => Some(commands::nega::command),
+            //"image" => Some(commands::image::command),
             _ => None,
         };
 
@@ -277,12 +279,9 @@ impl IrcBot {
     }
 
     fn see(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
-        self.check_sentiment(msg);
-
         self.scrape_urls(stream, msg)?;
         self.check_greeting(stream, msg)?;
         self.check_emote(stream, msg)?;
-
         Ok(())
     }
 
@@ -308,23 +307,6 @@ impl IrcBot {
             say(stream, &target, &String::from("❤️"))?;
         }
         Ok(())
-    }
-
-    fn check_sentiment(&mut self, msg: &IrcMessage) {
-        let result = sentiment::analyze(msg.args[1].clone());
-
-        match self.seen_nicks.get_mut(&msg.prefix.nick) {
-            Some(seen) => {
-                seen.sentiment_score += result.score;
-                seen.statements += 1;
-            },
-            None => {
-                self.seen_nicks.insert(msg.prefix.nick.clone(), SeenNick {
-                    sentiment_score: result.score,
-                    statements: 1,
-                });
-            }
-        }
     }
 
     fn scrape_urls(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
@@ -399,6 +381,7 @@ fn bot_main(running: &AtomicBool, bot: &mut IrcBot, stream: &mut IrcConnection) 
         match stream.read(&mut buffer) {
             Ok(bytes) => {
                 let s = String::from_utf8_lossy(&buffer[0..bytes]).to_string();
+                println!("{}", s);
                 if let Err(e) = handle_message(s, bot, stream) {
                     log::error!("error handling message: {}", e);
                 }
@@ -417,23 +400,29 @@ fn bot_main(running: &AtomicBool, bot: &mut IrcBot, stream: &mut IrcConnection) 
     Ok(())
 }
 
+struct NoCertificateVerification {}
 
-fn connect(bot: &IrcBot) -> Result<IrcConnection> {
-    let mut builder = SslConnector::builder(SslMethod::tls())?;
-    builder.set_options(SslOptions::ALL);
-    builder.set_options(SslOptions::NO_TLSV1_3);
-    builder.set_verify(SslVerifyMode::NONE);
-    let connector = builder.build();
+impl rustls::client::ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp: &[u8],
+        _now: std::time::SystemTime,
+    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
 
-    let tcp_stream = TcpStream::connect(&bot.host)?;
-    tcp_stream.set_nodelay(true)?;
-    tcp_stream.set_read_timeout(Some(Timeout::from_millis(1000)))?;
+    fn verify_tls12_signature(&self, message: &[u8], cert: &rustls::Certificate, dss: &rustls::internal::msgs::handshake::DigitallySignedStruct) -> std::result::Result<rustls::client::HandshakeSignatureValid, rustls::Error> {
+        return Ok(HandshakeSignatureValid::assertion());
+    }
 
-    let stream = connector.connect(&bot.host, tcp_stream)?;
-
-    Ok(stream)
+    fn verify_tls13_signature(&self, message: &[u8], cert: &rustls::Certificate, dss: &rustls::internal::msgs::handshake::DigitallySignedStruct) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        return Ok(HandshakeSignatureValid::assertion());
+    }
 }
-
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -477,19 +466,29 @@ fn main() -> Result<()> {
     while RUNNING.load(Ordering::Relaxed) {
         log::info!("connecting to {}", bot.host);
 
-        match connect(&bot) {
-            Ok(mut stream) => {
-                if let Err(e) = bot_main(&RUNNING, &mut bot, &mut stream) {
-                    log::error!("bot errored: {}", e);
-                }
-                if let Err(e) = stream.shutdown() {
-                    log::error!("error closing stream: {}", e);
-                }
-            }
-            Err(e) => {
-                log::error!("could not connect: {}", e);
-                thread::sleep(Timeout::from_millis(5000));
-            }
+        let verifier = Arc::new(NoCertificateVerification {});
+        let config = ClientConfig::builder()
+            .with_safe_default_cipher_suites()
+            .with_safe_default_kx_groups()
+            .with_protocol_versions(&vec![&rustls::version::TLS12])?
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+
+        let mut host_parts = bot.host.split(":");
+        let server_name;
+        if let Some(host) = host_parts.next() {
+            server_name = host.try_into();
+        } else {
+            server_name = "".try_into();
+        }
+        let mut conn = ClientConnection::new(Arc::new(config), server_name?)?;
+        let mut tcp_stream = TcpStream::connect(&bot.host)?;
+        tcp_stream.set_nodelay(true)?;
+        tcp_stream.set_read_timeout(Some(Timeout::from_millis(1000)))?;
+
+        let mut stream = Stream::new(&mut conn, &mut tcp_stream);
+        if let Err(e) = bot_main(&RUNNING, &mut bot, &mut stream) {
+            log::error!("bot errored: {}", e);
         }
     }
 
