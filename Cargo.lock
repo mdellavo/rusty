@@ -157,6 +157,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ee2393c4a91429dffb4bedf19f4d6abf27d8a732c8ce4980305d782e5426d57"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1177,6 +1183,7 @@ dependencies = [
  "chrono",
  "clap",
  "ctrlc",
+ "data-encoding",
  "env_logger",
  "lazy_static",
  "linkify",
@@ -1184,6 +1191,7 @@ dependencies = [
  "rand 0.8.4",
  "regex",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

@@ -6,7 +6,6 @@ extern crate linkify;
 extern crate regex;
 extern crate rustls;
 
-use std::collections::HashMap;
 use std::convert::TryInto;
 use std::error;
 use std::fmt;
@@ -20,11 +19,13 @@ use std::time::Duration as Timeout;
 
 use chrono::{DateTime, Duration, Utc};
 use clap::{App, Arg};
+use data_encoding::HEXLOWER;
 use env_logger;
 use linkify::{LinkFinder, LinkKind};
 use log;
 use rand::seq::IteratorRandom;
 use regex::Regex;
+use ring::digest::{Context, SHA256};
 use rusqlite::{params, Connection, Result as SQLResult, OptionalExtension};
 use rustls::client::HandshakeSignatureValid;
 use rustls::{ClientConfig, ClientConnection, Stream};
@@ -235,9 +236,11 @@ type Command = fn(
 
 #[derive(Debug)]
 pub struct SeenUrl {
-    owner: String,
+    id: i64,
+    owner_id: i64,
+    url_hash: String,
     count: i32,
-    first: DateTime<Utc>,
+    first_seen: DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -257,7 +260,6 @@ pub struct IrcBot {
 
     db: Connection,
 
-    seen_urls: HashMap<String, SeenUrl>,
     last_greet: DateTime<Utc>,
 }
 
@@ -277,7 +279,7 @@ CREATE TABLE IF NOT EXISTS seen_urls (
     owner_id INTEGER NOT NULL,
     url_hash TEXT NOT NULL UNIQUE,
     count INTEGER NOT NULL DEFAULT 1,
-    seen DATETIME NOT NULL
+    first_seen DATETIME NOT NULL
 );
 ";
 
@@ -300,7 +302,6 @@ impl IrcBot {
             channel: channel,
             ignore: None,
             db: db,
-            seen_urls: HashMap::new(),
             last_greet: Utc::now(),
         };
     }
@@ -385,6 +386,22 @@ impl IrcBot {
         return self.add_ident(msg);
     }
 
+    // FIXME refactor?
+    fn find_ident_by_id(&self, ident_id: i64) -> Option<Ident> {
+        return self.db.query_row(
+            "SELECT id, host, nick, realname FROM seen_idents WHERE id=?1",
+            params![ident_id],
+            |row| {
+               Ok(Ident {
+                    id: row.get(0)?,
+                    host: row.get(1)?,
+                    nick: row.get(2)?,
+                    realname: row.get(3)?,
+                })
+            }
+        ).optional().unwrap()
+    }
+
     fn find_ident_by_nick(&mut self, nick: &String) -> Option<Ident> {
         return self.db.query_row(
             "SELECT id, host, nick, realname FROM seen_idents WHERE nick=?1 ORDER BY last_seen DESC",
@@ -396,7 +413,8 @@ impl IrcBot {
                     nick: row.get(2)?,
                     realname: row.get(3)?,
                 })
-            }).optional().unwrap()
+            }
+        ).optional().unwrap()
     }
 
     fn see(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
@@ -433,34 +451,51 @@ impl IrcBot {
     }
 
     fn handle_url(&mut self, stream: &mut IrcConnection, msg: &IrcMessage, url: &str) -> Result<()> {
-        match self.seen_urls.get_mut(url) {
-            Some(seen) => {
-                if msg.prefix.nick != seen.owner {
-                    seen.count += 1;
-                    let target = &msg.args[0];
-                    say(
-                        stream,
-                        &target,
-                        &format!(
-                            "repost: {} (first seen at {} by {} / repost count: {})",
-                            url,
-                            seen.first.to_rfc2822(),
-                            seen.owner,
-                            seen.count
-                        ),
-                    )?;
-                }
+
+        let mut context = Context::new(&SHA256);
+        context.update(url.as_bytes());
+        let url_hash = HEXLOWER.encode(context.finish().as_ref());
+
+        let row = self.db.query_row(
+            "SELECT id, owner_id, url_hash, count, first_seen FROM seen_urls WHERE url_hash = ?1",
+            params![url_hash],
+            |row| {
+                Ok(SeenUrl {
+                    id: row.get(0)?,
+                    owner_id: row.get(1)?,
+                    url_hash: row.get(2)?,
+                    count: row.get(3)?,
+                    first_seen: row.get(4)?,
+                })
             }
-            None => {
-                self.seen_urls.insert(
-                    url.to_string(),
-                    SeenUrl {
-                        owner: String::from(&msg.prefix.nick),
-                        count: 1,
-                        first: Utc::now(),
-                    },
-                );
+        ).optional().unwrap();
+
+        let ident = self.get_ident(msg).unwrap();
+        let target = &msg.args[0];
+
+        if let Some(seen_url) = row {
+            if seen_url.owner_id != ident.id {
+
+                self.db.execute("UPDATE seen_urls SET count=count+1 WHERE id=?1", params![seen_url.id])?;
+
+                let owner = self.find_ident_by_id(seen_url.owner_id).unwrap();
+                say(
+                    stream,
+                    &target,
+                    &format!(
+                        "repost: {} (first seen at {} by {} / repost count: {})",
+                        url,
+                        seen_url.first_seen.to_rfc2822(),
+                        owner.nick,
+                        seen_url.count
+                    ),
+                )?;
             }
+        } else {
+            self.db.execute(
+                "INSERT INTO seen_urls (owner_id, url_hash, count, first_seen) VALUES (?1, ?2, ?3, ?4)",
+                params![ident.id, url_hash, 1, Utc::now()],
+            )?;
         }
 
         Ok(())
@@ -471,8 +506,8 @@ impl IrcBot {
         finder.url_must_have_scheme(false);
         finder.kinds(&[LinkKind::Url]);
         let text = msg.args[1..].join(" ");
-        let links: Vec<_> = finder.links(&text).collect();
-        for link in links.iter() {
+        let links = finder.links(&text);
+        for link in links {
             let url = link.as_str();
             self.handle_url(stream, msg, url)?;
         }
