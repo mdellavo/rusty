@@ -24,7 +24,8 @@ log = {}
 env_logger = {}
 # color_space = {}
 lazy_static = {}
-rusqlite = {}
+rusqlite = { features = ["chrono"] }
 rustls = { features=["dangerous_configuration"] }
 webpki = {}
 webpki-roots = {}
+linkify = {}

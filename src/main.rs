@@ -1,30 +1,33 @@
-extern crate lazy_static;
-extern crate ctrlc;
-extern crate regex;
 extern crate chrono;
 extern crate clap;
+extern crate ctrlc;
+extern crate lazy_static;
+extern crate linkify;
+extern crate regex;
 extern crate rustls;
 
-use std::fmt;
-use std::error;
-use std::io::prelude::*;
-use std::io::ErrorKind;
-use std::time::Duration as Timeout;
-use std::collections::HashSet;
-use std::net::TcpStream;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::convert::TryInto;
+use std::error;
+use std::fmt;
+use std::io::prelude::*;
+use std::io::ErrorKind;
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration as Timeout;
 
-use log;
+use chrono::{DateTime, Duration, Utc};
+use clap::{App, Arg};
 use env_logger;
-use clap::{Arg, App};
-use rustls::client::HandshakeSignatureValid;
-use rustls::{ClientConfig, ClientConnection, Stream};
+use linkify::{LinkFinder, LinkKind};
+use log;
 use rand::seq::IteratorRandom;
 use regex::Regex;
-use chrono::{DateTime, Utc, Duration};
+use rusqlite::{params, Connection, Result as SQLResult, OptionalExtension};
+use rustls::client::HandshakeSignatureValid;
+use rustls::{ClientConfig, ClientConnection, Stream};
 
 type Result<T> = std::result::Result<T, Box<dyn error::Error>>;
 type IrcConnection<'a> = Stream<'a, ClientConnection, TcpStream>;
@@ -39,7 +42,9 @@ struct Error {
 
 impl Error {
     fn new(msg: &str) -> Error {
-        Error{msg: msg.to_string()}
+        Error {
+            msg: msg.to_string(),
+        }
     }
 }
 
@@ -55,12 +60,12 @@ impl error::Error for Error {
     }
 }
 
-
-fn send(s: &mut IrcConnection, msg: &String)-> Result<()> {
+fn send(s: &mut IrcConnection, msg: &String) -> Result<()> {
     let mut out = String::from(msg);
     out.push_str("\r\n");
 
     // log::debug!("out: {:?}", out);
+
     s.write(out.as_bytes())?;
     Ok(())
 }
@@ -93,7 +98,7 @@ fn quit(s: &mut IrcConnection, msg: &String) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IrcPrefix {
     host: String,
     nick: String,
@@ -104,12 +109,12 @@ fn parse_prefix(s: &String) -> IrcPrefix {
     let (host, nick, realname);
 
     if let Some(host_idx) = s.find("@") {
-        host = String::from(&s[host_idx+1..]);
+        host = String::from(&s[host_idx + 1..]);
 
         let prefix = String::from(&s[..host_idx]);
         if let Some(prefix_idx) = prefix.find("!") {
             nick = String::from(&prefix[..prefix_idx]);
-            realname = String::from(&prefix[prefix_idx+1..]);
+            realname = String::from(&prefix[prefix_idx + 1..]);
         } else {
             nick = prefix;
             realname = String::from("");
@@ -121,17 +126,17 @@ fn parse_prefix(s: &String) -> IrcPrefix {
     }
 
     IrcPrefix {
-        host: host,
-        nick: nick,
-        realname: realname
+        host,
+        nick,
+        realname,
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IrcMessage {
     prefix: IrcPrefix,
     command: String,
-    args: Vec<String>
+    args: Vec<String>,
 }
 
 fn parse_message(s: &mut String) -> IrcMessage {
@@ -145,7 +150,7 @@ fn parse_message(s: &mut String) -> IrcMessage {
     }
 
     if let Some(trailing_idx) = s.find(" :") {
-        let trailing = String::from(&s[trailing_idx+2..]);
+        let trailing = String::from(&s[trailing_idx + 2..]);
         let rest = String::from(&s[idx..trailing_idx]);
         for part in rest.split_whitespace() {
             args.push(String::from(part));
@@ -162,14 +167,33 @@ fn parse_message(s: &mut String) -> IrcMessage {
     IrcMessage {
         prefix: parse_prefix(&prefix),
         command: command,
-        args: args
+        args: args,
     }
 }
 
-
 fn on_welcome(bot: &mut IrcBot, stream: &mut IrcConnection, _msg: &IrcMessage) -> Result<()> {
     join(stream, &bot.channel)?;
-    say(stream, &bot.channel, &String::from("high"))?;
+    say(stream, &bot.channel, &random_greeting())?;
+    Ok(())
+}
+
+fn on_command(bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
+    let end = msg.args[1].find(" ");
+    let end_idx;
+    if end.is_some() {
+        end_idx = end.unwrap();
+    } else {
+        end_idx = msg.args[1].len()
+    }
+
+    let command = String::from(&msg.args[1][1..end_idx]);
+    let rest;
+    if msg.args[1].len() > end_idx + 1 {
+        rest = String::from(msg.args[1][end_idx + 1..].trim());
+        } else {
+        rest = String::from("");
+    }
+    bot.dispatch(stream, &msg, &command, &rest)?;
     Ok(())
 }
 
@@ -178,27 +202,14 @@ fn on_privmsg(bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) ->
         return Ok(());
     }
 
+    let ident = bot.ensure_ident(msg)?;
+
     let mut prefix = String::from(&bot.nick);
     prefix.push_str(": ");
     if msg.args[1].starts_with(&prefix) {
-        say(stream, &bot.channel, &String::from("sup?"))?;
+        say(stream, &bot.channel, &random_greeting())?;
     } else if msg.args[1].starts_with("!") {
-        let end = msg.args[1].find(" ");
-        let end_idx;
-        if end.is_some() {
-            end_idx = end.unwrap();
-        } else {
-            end_idx = msg.args[1].len()
-        }
-
-        let command = String::from(&msg.args[1][1..end_idx]);
-        let rest;
-        if msg.args[1].len() > end_idx + 1 {
-            rest = String::from(msg.args[1][end_idx+1..].trim());
-        } else {
-            rest = String::from("");
-        }
-        bot.dispatch(stream, &msg, &command, &rest)?;
+        on_command(bot, stream, msg)?;
     } else {
         bot.see(stream, &msg)?;
     }
@@ -212,9 +223,15 @@ fn on_ping(_bot: &mut IrcBot, stream: &mut IrcConnection, msg: &IrcMessage) -> R
     Ok(())
 }
 
-type CallbackHandler = fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage) -> Result<()>;
-type Command = fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage, rest: &String) -> Result<()>;
+type CallbackHandler =
+    fn(bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessage) -> Result<()>;
 
+type Command = fn(
+    bot: &mut IrcBot,
+    stream: &mut IrcConnection,
+    message: &IrcMessage,
+    rest: &String,
+) -> Result<()>;
 
 #[derive(Debug)]
 pub struct SeenUrl {
@@ -224,9 +241,11 @@ pub struct SeenUrl {
 }
 
 #[derive(Debug)]
-pub struct SeenNick {
+pub struct Ident {
+    id: i64,
+    host: String,
     nick: String,
-    statements: i32,
+    realname: String,
 }
 
 #[derive(Debug)]
@@ -235,22 +254,62 @@ pub struct IrcBot {
     nick: String,
     channel: String,
     ignore: Option<Vec<String>>,
+
+    db: Connection,
+
     seen_urls: HashMap<String, SeenUrl>,
-    seen_nicks: HashMap<String, SeenNick>,
     last_greet: DateTime<Utc>,
 }
 
+static CREATE_TABLE_SEEN_IDENTS: &str = "
+CREATE TABLE IF NOT EXISTS seen_idents (
+    id INTEGER PRIMARY KEY,
+    nick TEXT,
+    realname TEXT,
+    host TEXT,
+    last_seen DATETIME NOT NULL
+);
+";
+
+static CREATE_TABLE_SEEN_URLS: &str = "
+CREATE TABLE IF NOT EXISTS seen_urls (
+    id INTEGER PRIMARY KEY,
+    owner_id INTEGER NOT NULL,
+    url_hash TEXT NOT NULL UNIQUE,
+    count INTEGER NOT NULL DEFAULT 1,
+    seen DATETIME NOT NULL
+);
+";
+
+
+static GREETINGS: &[&str] = &[
+    "hi", "high", "hello", "sirs", "pals", "buddies", "friends", "amigos", "compadres", "mates", "chums", "confidants", "brothers"
+];
+
+fn random_greeting() -> String {
+    let mut rng = rand::thread_rng();
+    return String::from(*GREETINGS.iter().choose(&mut rng).unwrap());
+}
+
+
 impl IrcBot {
-    fn new(host: String, nick: String, channel: String) -> IrcBot {
-        IrcBot {
+    fn new(host: String, nick: String, channel: String, db: Connection) -> IrcBot {
+        return IrcBot {
             host: host,
             nick: nick,
             channel: channel,
             ignore: None,
+            db: db,
             seen_urls: HashMap::new(),
-            seen_nicks: HashMap::new(),
             last_greet: Utc::now(),
-        }
+        };
+    }
+
+    fn init(&mut self) -> Result<()> {
+        self.db.execute(CREATE_TABLE_SEEN_IDENTS, [])?;
+        self.db.execute(CREATE_TABLE_SEEN_URLS, [])?;
+        commands::nega::init(self)?;
+        Ok(())
     }
 
     fn set_ignore(&mut self, ignore: Option<Vec<String>>) {
@@ -258,13 +317,20 @@ impl IrcBot {
     }
 
     // FIXME move to commands/mod.rs
-    fn dispatch(&mut self, stream: &mut IrcConnection, msg: &IrcMessage, command: &String, rest: &String) -> Result<()> {
+    fn dispatch(
+        &mut self,
+        stream: &mut IrcConnection,
+        msg: &IrcMessage,
+        command: &String,
+        rest: &String,
+    ) -> Result<()> {
         let handler: Option<Command> = match command.as_str() {
             "weather" => Some(commands::weather::command),
             "ud" => Some(commands::ud::command),
             //"giphy" => Some(commands::giphy::command),
             "strain" => Some(commands::strain::command),
-            //"nega" => Some(commands::nega::command),
+            "nega" => Some(commands::nega::command_nega),
+            "kudos" => Some(commands::nega::command_kudos),
             //"image" => Some(commands::image::command),
             _ => None,
         };
@@ -278,6 +344,61 @@ impl IrcBot {
         Ok(())
     }
 
+    fn get_ident(&mut self, msg: &IrcMessage) -> Option<Ident> {
+        return self.db.query_row(
+            "SELECT id, host, nick, realname FROM seen_idents WHERE host=?1 AND nick=?2 AND realname=?3",
+            params![msg.prefix.host, msg.prefix.nick, msg.prefix.realname],
+            |row| {
+               Ok(Ident {
+                    id: row.get(0)?,
+                    host: row.get(1)?,
+                    nick: row.get(2)?,
+                    realname: row.get(3)?,
+                })
+            }).optional().unwrap()
+    }
+
+    fn update_last_seen(&mut self, ident: &Ident) -> Result<()> {
+        self.db.execute("UPDATE seen_idents SET last_seen=?1 WHERE id=?2", params![Utc::now(), ident.id])?;
+        Ok(())
+    }
+
+    fn add_ident(&mut self, msg: &IrcMessage) -> Result<Ident> {
+        self.db.execute(
+            "INSERT INTO seen_idents(host, nick, realname, last_seen) VALUES (?1, ?2, ?3, ?4)",
+            params![msg.prefix.host, msg.prefix.nick, msg.prefix.realname, Utc::now()],
+        )?;
+
+        Ok(Ident {
+            id: self.db.last_insert_rowid(),
+            host: msg.prefix.host.clone(),
+            nick: msg.prefix.nick.clone(),
+            realname: msg.prefix.realname.clone(),
+        })
+    }
+
+    fn ensure_ident(&mut self, msg: &IrcMessage) -> Result<Ident> {
+        if let Some(ident) = self.get_ident(msg) {
+            self.update_last_seen(&ident)?;
+            return Ok(ident);
+        }
+        return self.add_ident(msg);
+    }
+
+    fn find_ident_by_nick(&mut self, nick: &String) -> Option<Ident> {
+        return self.db.query_row(
+            "SELECT id, host, nick, realname FROM seen_idents WHERE nick=?1 ORDER BY last_seen DESC",
+            params![nick],
+            |row| {
+               Ok(Ident {
+                    id: row.get(0)?,
+                    host: row.get(1)?,
+                    nick: row.get(2)?,
+                    realname: row.get(3)?,
+                })
+            }).optional().unwrap()
+    }
+
     fn see(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
         self.scrape_urls(stream, msg)?;
         self.check_greeting(stream, msg)?;
@@ -286,14 +407,16 @@ impl IrcBot {
     }
 
     fn check_greeting(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
-        let greetings :HashSet<&str> = ["hi", "high", "hello", "sirs", "pals", "buddies", "friends", "amigos"].iter().cloned().collect();
 
         let now = Utc::now();
         let should_greet = (self.last_greet + Duration::minutes(5)) < now;
-        if msg.args.len() == 2 && greetings.contains(&msg.args[1].as_str()) && should_greet {
+        if msg.args.len() == 2 && GREETINGS.contains(&msg.args[1].as_str()) && should_greet {
             let target = &msg.args[0];
-            let mut rng = rand::thread_rng();
-            say(stream, &target, &String::from(*greetings.iter().choose(&mut rng).unwrap()))?;
+            say(
+                stream,
+                &target,
+                &random_greeting(),
+            )?;
             self.last_greet = now;
         }
         Ok(())
@@ -309,33 +432,53 @@ impl IrcBot {
         Ok(())
     }
 
-    fn scrape_urls(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
-        let re = Regex::new(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*(),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+").unwrap();
-        let text = msg.args[1..].join(" ");
-        for found in re.find_iter(&text) {
-            let url = &text[found.start()..found.end()];
-            match self.seen_urls.get_mut(url) {
-                Some(seen) => {
-                    if msg.prefix.nick != seen.owner {
-                        seen.count += 1;
-                        let target = &msg.args[0];
-                        say(stream, &target, &format!("repost: {} (first seen at {} by {} / repost count: {})",
-                                                      url, seen.first.to_rfc2822(), seen.owner, seen.count))?;
-                    }
-                },
-                None => {
-                    self.seen_urls.insert(url.to_string(), SeenUrl {
-                        owner: String::from(&msg.prefix.nick),
-                        count: 1,
-                        first: Utc::now()
-                    });
+    fn handle_url(&mut self, stream: &mut IrcConnection, msg: &IrcMessage, url: &str) -> Result<()> {
+        match self.seen_urls.get_mut(url) {
+            Some(seen) => {
+                if msg.prefix.nick != seen.owner {
+                    seen.count += 1;
+                    let target = &msg.args[0];
+                    say(
+                        stream,
+                        &target,
+                        &format!(
+                            "repost: {} (first seen at {} by {} / repost count: {})",
+                            url,
+                            seen.first.to_rfc2822(),
+                            seen.owner,
+                            seen.count
+                        ),
+                    )?;
                 }
             }
+            None => {
+                self.seen_urls.insert(
+                    url.to_string(),
+                    SeenUrl {
+                        owner: String::from(&msg.prefix.nick),
+                        count: 1,
+                        first: Utc::now(),
+                    },
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn scrape_urls(&mut self, stream: &mut IrcConnection, msg: &IrcMessage) -> Result<()> {
+        let mut finder = LinkFinder::new();
+        finder.url_must_have_scheme(false);
+        finder.kinds(&[LinkKind::Url]);
+        let text = msg.args[1..].join(" ");
+        let links: Vec<_> = finder.links(&text).collect();
+        for link in links.iter() {
+            let url = link.as_str();
+            self.handle_url(stream, msg, url)?;
         }
         Ok(())
     }
 }
-
 
 fn handle_message(data: String, bot: &mut IrcBot, stream: &mut IrcConnection) -> Result<()> {
     let lines = data.lines();
@@ -372,27 +515,28 @@ fn handle_message(data: String, bot: &mut IrcBot, stream: &mut IrcConnection) ->
     Ok(())
 }
 
-
 fn bot_main(running: &AtomicBool, bot: &mut IrcBot, stream: &mut IrcConnection) -> Result<()> {
     ident(stream, &bot.nick)?;
 
-    while running.load(Ordering::Relaxed) {
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
         let mut buffer = [0; 4096];
         match stream.read(&mut buffer) {
-            Ok(bytes) => {
-                let s = String::from_utf8_lossy(&buffer[0..bytes]).to_string();
-                println!("{}", s);
-                if let Err(e) = handle_message(s, bot, stream) {
-                    log::error!("error handling message: {}", e);
+                Ok(bytes) => {
+                    let s = String::from_utf8_lossy(&buffer[0..bytes]).to_string();
+                    if let Err(e) = handle_message(s, bot, stream) {
+                        log::error!("error handling message: {}", e);
+                    }
                 }
-            },
-            Err(e) => {
-                if let ErrorKind::WouldBlock = e.kind() {
-                    continue;
+                Err(e) => {
+                    if let ErrorKind::WouldBlock = e.kind() {
+                        continue;
+                    }
+                    return Err(Box::new(e));
                 }
-                return Err(Box::new(e));
             }
-        }
     }
 
     quit(stream, &String::from("out"))?;
@@ -415,47 +559,69 @@ impl rustls::client::ServerCertVerifier for NoCertificateVerification {
         Ok(rustls::client::ServerCertVerified::assertion())
     }
 
-    fn verify_tls12_signature(&self, message: &[u8], cert: &rustls::Certificate, dss: &rustls::internal::msgs::handshake::DigitallySignedStruct) -> std::result::Result<rustls::client::HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::Certificate,
+        dss: &rustls::internal::msgs::handshake::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::HandshakeSignatureValid, rustls::Error> {
         return Ok(HandshakeSignatureValid::assertion());
     }
 
-    fn verify_tls13_signature(&self, message: &[u8], cert: &rustls::Certificate, dss: &rustls::internal::msgs::handshake::DigitallySignedStruct) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::Certificate,
+        dss: &rustls::internal::msgs::handshake::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
         return Ok(HandshakeSignatureValid::assertion());
     }
 }
+
 
 fn main() -> Result<()> {
     env_logger::init();
 
     let args = App::new("rusty")
         .version("0.1")
-        .arg(Arg::new("host")
-             .takes_value(true)
-             .required(true)
-             .index(1))
-        .arg(Arg::new("nick")
-             .takes_value(true)
-             .required(true)
-             .index(2))
-        .arg(Arg::new("channel")
-             .takes_value(true)
-             .required(true)
-             .index(3))
-        .arg(Arg::new("ignore")
-             .takes_value(true)
-             .long("ignore")
-             .multiple_occurrences(true))
+        .arg(Arg::new("host").takes_value(true).required(true).index(1))
+        .arg(Arg::new("nick").takes_value(true).required(true).index(2))
+        .arg(
+            Arg::new("channel")
+                .takes_value(true)
+                .required(true)
+                .index(3),
+        )
+        .arg(
+            Arg::new("ignore")
+                .takes_value(true)
+                .long("ignore")
+                .multiple_occurrences(true),
+        )
         .get_matches();
 
     let host = String::from(args.value_of("host").unwrap());
     let nick = String::from(args.value_of("nick").unwrap());
     let channel = String::from(args.value_of("channel").unwrap());
-    let mut bot: IrcBot = IrcBot::new(host, nick, channel);
+
+    let db_path = format!("./{nick}-at-{host}.db", host=host, nick=nick);
+    let db = Connection::open(&db_path).expect("cannot open db");
+
+    let mut bot: IrcBot = IrcBot::new(host, nick, channel, db);
+    bot.init()?;
 
     if let Some(ignore) = args.values_of("ignore") {
         let values: Vec<String> = ignore.map(|s| s.to_string()).collect();
         bot.set_ignore(Some(values));
     }
+
+    let verifier = Arc::new(NoCertificateVerification {});
+    let config = ClientConfig::builder()
+        .with_safe_default_cipher_suites()
+        .with_safe_default_kx_groups()
+        .with_safe_default_protocol_versions()?
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
 
     static RUNNING: AtomicBool = AtomicBool::new(true);
     ctrlc::set_handler(|| {
@@ -466,29 +632,27 @@ fn main() -> Result<()> {
     while RUNNING.load(Ordering::Relaxed) {
         log::info!("connecting to {}", bot.host);
 
-        let verifier = Arc::new(NoCertificateVerification {});
-        let config = ClientConfig::builder()
-            .with_safe_default_cipher_suites()
-            .with_safe_default_kx_groups()
-            .with_protocol_versions(&vec![&rustls::version::TLS12])?
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
-
         let mut host_parts = bot.host.split(":");
         let server_name;
         if let Some(host) = host_parts.next() {
-            server_name = host.try_into();
+            server_name = host.try_into()?;
         } else {
-            server_name = "".try_into();
+            server_name = "".try_into()?;
         }
-        let mut conn = ClientConnection::new(Arc::new(config), server_name?)?;
-        let mut tcp_stream = TcpStream::connect(&bot.host)?;
-        tcp_stream.set_nodelay(true)?;
-        tcp_stream.set_read_timeout(Some(Timeout::from_millis(1000)))?;
 
+        let mut conn = ClientConnection::new(Arc::new(config.clone()), server_name)?;
+        let mut tcp_stream = TcpStream::connect(&bot.host)?;
+        tcp_stream.set_read_timeout(Some(Timeout::from_millis(1000)))?;
         let mut stream = Stream::new(&mut conn, &mut tcp_stream);
         if let Err(e) = bot_main(&RUNNING, &mut bot, &mut stream) {
             log::error!("bot errored: {}", e);
+        }
+
+        stream.conn.send_close_notify();
+        stream.sock.shutdown(std::net::Shutdown::Both)?;
+
+        if RUNNING.load(Ordering::Relaxed) {
+            thread::sleep(Timeout::from_millis(5000));
         }
     }
 
