@@ -26,7 +26,7 @@ pub fn command(_bot: &mut IrcBot, stream: &mut IrcConnection, message: &IrcMessa
         return Ok(());
     }
 
-    let key = env::var("OPENWEATHER_API_KEY").unwrap();
+    let key = env::var("OPENWEATHER_API_KEY")?;
     let url = format!("https://api.openweathermap.org/data/2.5/weather?q={},us&APPID={}", parts[0], key);
     log::debug!("GET {}", url);
     let result = get_reqw_client()
